@@ -2,7 +2,7 @@ import json
 import logging
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Callable
 
 logger = logging.getLogger("RobotApp")
 
@@ -16,21 +16,21 @@ class CanConfig:
     no_listener_timeout: float = 2.0
 
 @dataclass
-class ParserConfig:
-    """Parser configuration, including command response lengths."""
-    parser_sleep: float = 0.01
-    response_lengths: Dict[int, int] = None
-
-    def __post_init__(self):
-        if self.response_lengths is None:
-            self.response_lengths = {}
-
-@dataclass
 class MotorConfig:
     """Individual motor configuration."""
     name: str
     limit_positive: int
     limit_negative: int
+
+@dataclass
+class ParserConfig:
+    """CAN frame parser configuration."""
+    response_lengths: Dict[int, int] = None
+
+    def __post_init__(self):
+        # Avoid mutable default argument pitfall (dataclasses forbid dict as default directly)
+        if self.response_lengths is None:
+            self.response_lengths = {}
 
 class Config:
     """
@@ -51,7 +51,7 @@ class Config:
             ValueError: If required config sections are missing
         """
         self.config_path = Path(config_file)
-        
+
         if not self.config_path.exists():
             logger.error("Config file not found: %s", self.config_path)
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
@@ -68,6 +68,16 @@ class Config:
         can_data = data.get('can', {})
         self.can = CanConfig(**can_data)
         logger.debug("CAN config: %s", self.can)
+
+        # Parse parser config (with defaults if not in JSON)
+        parser_data = data.get('parser', {})
+        if 'response_lengths' in parser_data:
+            # JSON keys are hex strings like "0x31", convert to int with base 16
+            parser_data['response_lengths'] = {
+                int(k, 16): v for k, v in parser_data['response_lengths'].items()
+            }
+        self.parser = ParserConfig(**parser_data)
+        logger.debug("Parser config: %s", self.parser)
 
         # Parse motors config
         motors_data = data.get('motors', {})
@@ -93,20 +103,20 @@ class Config:
     def get_motor(self, motor_id: int) -> MotorConfig:
         """
         Get motor configuration by ID.
-        
+
         Args:
             motor_id (int): Motor ID
-            
+
         Returns:
             MotorConfig: Motor configuration object
-            
+
         Raises:
             KeyError: If motor_id not found
         """
         if motor_id not in self.motors:
             logger.warning("Motor ID %d not found in config", motor_id)
             raise KeyError(f"Motor ID {motor_id} not found in config")
-        
+
         return self.motors[motor_id]
 
     def __repr__(self):

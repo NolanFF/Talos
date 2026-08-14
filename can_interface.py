@@ -1,25 +1,32 @@
+# can_interface.py
 import can
 import threading
 import logging
 from config import Config
+from data_manager import DataManager
 
 logger = logging.getLogger("RobotApp")
+
 
 class CanInterface:
     """
     Class that wraps the CAN bus connection.
     It handles opening, closing, and gives access to the bus
     for sending/receiving messages.
+    
+    Uses a DataManager for thread-safe centralized state management.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, data_manager: DataManager):
         """
-        Initialize CAN interface with configuration from Config object.
+        Initialize CAN interface with configuration and data manager.
 
         Args:
             config (Config): Configuration object containing CAN settings and motor IDs
+            data_manager (DataManager): Centralized thread-safe data store
         """
         self.config = config
+        self.data_manager = data_manager
         self.channel = config.can.channel
         self.bustype = config.can.bustype
         self.bitrate = config.can.bitrate
@@ -27,25 +34,11 @@ class CanInterface:
         self.no_listener_timeout = config.can.no_listener_timeout
         self.bus = None
 
-        # Get motor IDs from config
-        motor_ids = config.get_motor_ids()
-
-        # Pre-initialize the buffer with a fixed structure for each known motor
-        self.raw_frames_buffer = {
-            motor_id: {
-                "last_rx_raw": None,
-                "old_rx_raw": None,
-                "last_tx_raw": None,
-                "last_rx_command_byte": None,
-                "last_rx_data": None,
-            }
-            for motor_id in motor_ids
-        }
-
         # Threading control for the background listener
         self._listener_thread = None
         self._stop_event = threading.Event()
 
+        motor_ids = config.get_motor_ids()
         logger.debug("CanInterface initialized with channel=%s, bustype=%s, bitrate=%d, %d motors",
                      self.channel, self.bustype, self.bitrate, len(motor_ids))
 
@@ -94,7 +87,7 @@ class CanInterface:
     def send_command(self, motor_id, command_bytes):
         """
         Builds and sends a full CAN command: motor_id + command_bytes + checksum.
-        Stores the raw TX frame (without arbitration ID) for later echo detection on RX.
+        Stores the raw TX frame in DataManager for later echo detection on RX.
 
         Args:
             motor_id (int): The motor ID, used as arbitration_id (e.g. 0x01)
@@ -105,7 +98,7 @@ class CanInterface:
                          motor_id)
             return
 
-        if motor_id not in self.raw_frames_buffer:
+        if motor_id not in self.data_manager.motors:
             logger.error("Motor 0x%02X not in registered motors list, command not sent",
                          motor_id)
             return
@@ -127,8 +120,10 @@ class CanInterface:
                          motor_id, str(e))
             return
 
-        # Store raw TX frame (without arbitration ID) for echo detection on RX
-        self.raw_frames_buffer[motor_id]["last_tx_raw"] = bytes(data)
+        # Store raw TX frame in DataManager for echo detection on RX
+        self.data_manager.update_tx_frame(motor_id, bytes(data))
+
+    # Dans can_interface.py, modifie la méthode receive_command()
 
     def receive_command(self, message):
         """
@@ -142,41 +137,49 @@ class CanInterface:
         The command byte (first byte) and checksum (last byte) are removed before
         storing the data separately.
 
+        Parse and results are automatically stored in DataManager.
+
         Args:
             message (can.Message): A CAN message instance received from the bus
+            parse_and_store (bool): if True, parse and store in DataManager
         """
         motor_id = message.arbitration_id
 
-        if motor_id not in self.raw_frames_buffer:
-            logger.error("Motor 0x%02X not in registered motors list, frame ignored", motor_id)
+        if motor_id not in self.data_manager.motors:
+            logger.error("Motor 0x%02X not in registered motors", motor_id)
             return
 
-        buffer = self.raw_frames_buffer[motor_id]
         raw_data = bytes(message.data)
 
-        # TX echo detection: if identical to the last frame we sent, skip parsing entirely.
-        # buffer["last_tx_raw"] is None until the first send_command() call for this motor;
-        # comparing bytes to None simply returns False, so no crash risk here.
-        if buffer["last_tx_raw"] is not None and raw_data == buffer["last_tx_raw"]: return
-        if buffer["old_rx_raw"] is not None and  raw_data == buffer["old_rx_raw"]: return
+        # TX echo detection
+        last_tx = self.data_manager.get_tx_frame(motor_id)
+        if last_tx is not None and raw_data == last_tx:
+            logger.debug("TX echo detected for motor 0x%02X, skipping", motor_id)
+            return
 
+        old_rx = self.data_manager.get_old_rx_frame(motor_id)
+        if old_rx is not None and raw_data == old_rx:
+            logger.debug("Duplicate frame detected for motor 0x%02X, skipping", motor_id)
+            return
+
+        # Extract command byte and payload
         command_byte = raw_data[0]
+        payload = raw_data[1:-1]  # Remove command byte and checksum
 
-        # Remove command byte (first) and checksum (last)
-        data = raw_data[1:-1]
-
-        if len(data) == 0:
-            logger.warning("CAN command from motor ID 0x%02X has no data after removing command/checksum, ignored",
+        if len(payload) == 0:
+            logger.warning("CAN command from motor 0x%02X has no data after removing command/checksum",
                         motor_id)
             return
 
-        buffer["old_rx_raw"] = buffer["last_rx_raw"]
-        buffer["last_rx_raw"] = raw_data
-        buffer["last_rx_command_byte"] = command_byte
-        buffer["last_rx_data"] = data
+        # Store in DataManager
+        self.data_manager.update_rx_frame(motor_id, raw_data, command_byte, payload)
 
         logger.debug("Frame stored: motor_id=0x%02X, command_byte=0x%02X, data=%s",
-                    motor_id, command_byte, data.hex())
+                    motor_id, command_byte, payload.hex())
+
+        # Parse and store results if enabled
+        from parser import parse_motor_frame
+        parse_motor_frame(motor_id, command_byte, payload, self.config, self.data_manager)
 
     def _listen(self):
         """Background listener thread that continuously receives CAN messages."""

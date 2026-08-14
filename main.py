@@ -1,48 +1,63 @@
+# main.py
 import logging
 from config import Config
 from logs.logger import setup_logger
+from data_manager import DataManager
 from can_interface import CanInterface
 
 # Initialize logger first
 logger = setup_logger()
 
-def print_buffer(can_iface):
-    """Display the current raw_frames_buffer in a readable format."""
-    if not can_iface.raw_frames_buffer:
-        print("\n[Buffer] Empty\n")
+
+def print_buffer(data_manager, config):
+    """Display the current motor states from DataManager in a readable format."""
+    motor_ids = config.get_motor_ids()
+    
+    if not motor_ids:
+        print("\n[Buffer] No motors configured\n")
         return
 
-    print("\n[Raw Frames Buffer]")
-    for motor_id, buffer in can_iface.raw_frames_buffer.items():
+    print("\n[Raw Frames Buffer - DataManager]")
+    for motor_id in motor_ids:
         # Get motor name from config
         try:
-            motor = can_iface.config.get_motor(motor_id)
+            motor = config.get_motor(motor_id)
             motor_name = motor.name
         except KeyError:
             motor_name = "Unknown"
 
+        # Get snapshot from DataManager (thread-safe)
+        snapshot = data_manager.get_motor_snapshot(motor_id)
+
         print(f"  Motor 0x{motor_id:02X} ({motor_name}):")
 
-        last_tx_raw = buffer.get("last_tx_raw")
-        last_rx_raw = buffer.get("last_rx_raw")
-        old_rx_raw = buffer.get("old_rx_raw")
-        last_rx_command_byte = buffer.get("last_rx_command_byte")
-        last_rx_data = buffer.get("last_rx_data")
+        tx_raw = snapshot.get("tx_raw")
+        rx_raw = snapshot.get("rx_raw")
+        old_rx_raw = snapshot.get("old_rx_raw")
+        has_changed = snapshot.get("has_changed")
+        rx_command_byte = snapshot.get("rx_command_byte")
+        rx_data = snapshot.get("rx_data")
+        encoder_value = snapshot.get("encoder_value")
+        io_states = snapshot.get("io_states")
+        analog_values = snapshot.get("analog_values")
 
-        tx_hex = last_tx_raw.hex(" ").upper() if last_tx_raw is not None else "None"
-        rx_hex = last_rx_raw.hex(" ").upper() if last_rx_raw is not None else "None"
-        orx_hex = old_rx_raw.hex(" ").upper() if old_rx_raw is not None else "None"
-        data_hex = last_rx_data.hex(" ").upper() if last_rx_data is not None else "None"
-        command_byte_str = f"0x{last_rx_command_byte:02X}" if last_rx_command_byte is not None else "None"
+        tx_hex = tx_raw if tx_raw is not None else "None"
+        rx_hex = rx_raw if rx_raw is not None else "None"
+        orx_hex = old_rx_raw if old_rx_raw is not None else "None"
+        data_hex = rx_data if rx_data is not None else "None"
+        command_byte_str = rx_command_byte if rx_command_byte is not None else "None"
 
-        print(f"    Last TX raw:          {tx_hex}")
-        print(f"    Last RX raw:          {rx_hex}")
-        print(f"    Old  RX raw:          {orx_hex}")
-        print(f"    Last RX command byte: {command_byte_str}")
-        print(f"    Last RX data:         {data_hex}")
+        print(f"    TX raw:          {tx_hex}")
+        print(f"    RX raw:          {rx_hex}")
+        print(f"    Old RX raw:      {orx_hex}")
+        print(f"    Has Changed:     {has_changed}")
+        print(f"    RX command byte: {command_byte_str}")
+        print(f"    RX data:         {data_hex}")
+        print(f"    Encoder value:   {encoder_value}")
     print()
 
-def send_command_interactive(can_iface):
+
+def send_command_interactive(can_iface, config):
     """Prompt user to enter motor_id and command_bytes, then send."""
     try:
         motor_id_str = input("Enter motor ID (hex, e.g., 01): ").strip()
@@ -50,7 +65,7 @@ def send_command_interactive(can_iface):
 
         # Validate motor ID exists in config
         try:
-            motor = can_iface.config.get_motor(motor_id)
+            motor = config.get_motor(motor_id)
             logger.debug("Motor found in config: %s", motor.name)
         except KeyError:
             logger.warning("Motor ID 0x%02X not found in config", motor_id)
@@ -73,17 +88,23 @@ def send_command_interactive(can_iface):
         logger.error("Error sending command: %s", str(e))
         print(f"✗ Error: {str(e)}\n")
 
+
 def main():
     """Main interactive loop."""
     logger.info("=== Robot CAN Interface Starting ===")
+    can_iface = None
 
     try:
         # Load configuration
         config = Config()
         logger.info("Configuration loaded: %s", config)
 
-        # Create CAN interface with config
-        can_iface = CanInterface(config)
+        # Initialize DataManager with motor IDs from config
+        data_manager = DataManager(config.get_motor_ids())
+        logger.info("DataManager initialized")
+
+        # Create CAN interface with config and data_manager
+        can_iface = CanInterface(config, data_manager)
 
         # Connect to CAN bus
         can_iface.connect()
@@ -111,10 +132,10 @@ def main():
                 user_input = input(">>> ").strip().lower()
 
                 if user_input == "send":
-                    send_command_interactive(can_iface)
+                    send_command_interactive(can_iface, config)
 
                 elif user_input == "show":
-                    print_buffer(can_iface)
+                    print_buffer(data_manager, config)
 
                 elif user_input == "motors":
                     print("\n[Configured Motors]")
@@ -159,8 +180,10 @@ def main():
 
     finally:
         logger.info("Cleaning up...")
-        can_iface.disconnect()
+        if can_iface is not None:
+            can_iface.disconnect()
         logger.info("=== Robot CAN Interface Stopped ===")
+
 
 if __name__ == "__main__":
     exit(main() or 0)

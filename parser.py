@@ -1,105 +1,148 @@
-import threading
-import time
-from typing import Dict, Any, List
+# parser.py
+import logging
+from config import Config
+from data_manager import DataManager
 
-def parse_0x31(frame_data: bytes) -> int:
+logger = logging.getLogger("RobotApp")
+
+
+def parse_command_31(data: bytes, config: Config) -> dict:
     """
-    Parse encoder value from 0x31 command frame.
-    
-    Takes the first 2 bytes (big-endian) and converts to decimal.
-    
+    Parse command 0x31: encoder position feedback.
+
+    Frame data format:
+        - N bytes (see config.parser.response_lengths[0x31]), big-endian, unsigned integer
+        - represents encoder position in raw counts
+
     Args:
-        frame_data (bytes): The 6 useful data bytes from the CAN message
-        
+        data (bytes): raw payload bytes for this command (already length-checked)
+        config (Config): app config (unused here, kept for signature consistency)
+
     Returns:
-        int: Encoder value in decimal
-        
-    Example:
-        [0x00, 0x00, 0x00, 0x01, 0xA9, 0x2E] → 108846
+        dict: {"position": int}
     """
-    # Take first 2 bytes, big-endian conversion
-    encoder_value = int.from_bytes(frame_data[0:2], byteorder='big')
-    return encoder_value
+    # Unsigned big-endian conversion: no negative position possible
+    position = int.from_bytes(data, byteorder="big", signed=False)
 
+    logger.debug("Parsed encoder position: %d", position)
 
-def has_frame_changed(current: List[int], previous: List[int]) -> bool:
+    return {"position": position}
+
+def parse_command_3D(data: bytes, config: Config) -> dict:
     """
-    Compare current frame with previous frame.
-    
+    Parse command 0x3D: encoder position feedback.
+
+    Frame data format:
+        - N bytes (see config.parser.response_lengths[0x31]), big-endian, unsigned integer
+        - represents encoder position in raw counts
+
     Args:
-        current (List[int]): Current frame bytes
-        previous (List[int]): Previous frame bytes (None if first reception)
-        
+        data (bytes): raw payload bytes for this command (already length-checked)
+        config (Config): app config (unused here, kept for signature consistency)
+
     Returns:
-        bool: True if frames are different or if previous is None
+        dict: {"position": int}
     """
-    if previous is None:
-        return True
-    return current != previous
+    # Unsigned big-endian conversion: no negative position possible
+    position = int.from_bytes(data, byteorder="big", signed=False)
+
+    logger.debug("Parsed encoder position: %d", position)
+
+    return {"position": position}
 
 
-def monitor_frames(raw_frames_buffer: Dict[str, Dict], stop_event: threading.Event):
+# Command byte constants (add more as we implement them)
+CMD_ENCODER_POSITION = 0x31
+CMD_LIBERATION_MOTEUR = 0x3D
+
+# Registry mapping command byte -> parser function
+# Each parser function must have signature: (data: bytes, config: Config) -> dict
+COMMAND_PARSERS = {
+    CMD_ENCODER_POSITION: parse_command_31,
+    CMD_LIBERATION_MOTEUR: parse_command_3D,
+}
+
+
+def parse_motor_frame(motor_id: int, command_byte: int, data: bytes, 
+                      config: Config, data_manager: DataManager = None) -> dict:
     """
-    Monitor received frames in a separate thread.
-    
-    For each robot and command type:
-    - Check if current frame differs from previous
-    - If yes: parse it and update the robot dictionary
-    - Update "previous" with current frame
-    
+    Dispatch a single motor's frame data to the correct parser
+    based on the command byte, after validating the expected length
+    from config.parser.response_lengths.
+
+    If data_manager is provided, the parsed results are automatically
+    stored in the motor's state (e.g., encoder_value, io_states, etc.).
+
     Args:
-        raw_frames_buffer (Dict): The shared frames buffer from can_interface
-        stop_event (threading.Event): Thread stop signal
-    """
-    while not stop_event.is_set():
-        try:
-            # Iterate over all robots
-            for robot_id, robot_data in raw_frames_buffer.items():
-                
-                # Iterate over all command types for this robot
-                for command_byte, frame_info in robot_data.items():
-                    
-                    current_frame = frame_info.get("current")
-                    previous_frame = frame_info.get("previous")
-                    
-                    # Check if frame has changed
-                    if current_frame is not None and has_frame_changed(current_frame, previous_frame):
-                        
-                        # Route to appropriate parser based on command_byte
-                        if command_byte == 0x31:
-                            parsed_value = parse_0x31(bytes(current_frame))
-                            frame_info["encoder_value"] = parsed_value
-                        
-                        # Add more parsers here as needed:
-                        # elif command_byte == 0x32:
-                        #     parsed_value = parse_0x32(bytes(current_frame))
-                        #     frame_info["some_field"] = parsed_value
-                        
-                        # Update previous frame
-                        frame_info["previous"] = current_frame.copy()
-        
-        except Exception as e:
-            print(f"[monitor_frames] Error: {e}")
-        
-        # Small sleep to avoid CPU spinning
-        time.sleep(0.01)
+        motor_id (int): motor ID (for logging context)
+        command_byte (int): command type byte from the frame
+        data (bytes): payload data to parse
+        config (Config): app config, used to fetch expected length and forwarded to the parser
+        data_manager (DataManager, optional): if provided, stores parsed data in motor state
 
-
-def start_monitor_thread(raw_frames_buffer: Dict[str, Dict]) -> threading.Event:
-    """
-    Start the frame monitor in a background thread.
-    
-    Args:
-        raw_frames_buffer (Dict): The shared frames buffer from can_interface
-        
     Returns:
-        threading.Event: Stop event to signal thread shutdown
+        dict: parsed result, or empty dict if no parser matches or length mismatch
     """
-    stop_event = threading.Event()
-    monitor_thread = threading.Thread(
-        target=monitor_frames,
-        args=(raw_frames_buffer, stop_event),
-        daemon=False
-    )
-    monitor_thread.start()
-    return stop_event
+    parser_func = COMMAND_PARSERS.get(command_byte)
+
+    if parser_func is None:
+        logger.debug(
+            "No parser registered for command 0x%02X (motor 0x%02X)",
+            command_byte, motor_id
+        )
+        return {}
+
+    expected_length = config.parser.response_lengths.get(command_byte)
+
+    if expected_length is None:
+        logger.warning(
+            "No expected length configured for command 0x%02X (motor 0x%02X)",
+            command_byte, motor_id
+        )
+        return {}
+
+    if len(data) != expected_length:
+        logger.warning(
+            "Invalid data length for command 0x%02X (motor 0x%02X): expected %d, got %d",
+            command_byte, motor_id, expected_length, len(data)
+        )
+        return {}
+
+    # Parse the frame
+    parsed_result = parser_func(data, config)
+
+    # If DataManager provided, store the parsed results
+    if data_manager is not None and parsed_result:
+        _store_parsed_results(motor_id, command_byte, parsed_result, data_manager)
+
+    return parsed_result
+
+
+def _store_parsed_results(motor_id: int, command_byte: int, 
+                          parsed_result: dict, data_manager: DataManager):
+    """
+    Store parsed results into DataManager based on command byte.
+
+    This function maps parsed data to the appropriate motor state fields
+    (encoder_value, io_states, analog_values, etc.).
+
+    Args:
+        motor_id (int): motor ID
+        command_byte (int): command type (determines what to store)
+        parsed_result (dict): result dict from parser function
+        data_manager (DataManager): manager instance
+    """
+    if command_byte == CMD_ENCODER_POSITION:
+        # Store encoder position
+        position = parsed_result.get("position")
+        if position is not None:
+            data_manager.set_encoder_value(motor_id, position)
+            logger.debug("Stored encoder position for motor 0x%02X: %d", motor_id, position)
+
+    # Add more command handlers here as parsers are implemented
+    # Example:
+    # elif command_byte == CMD_IO_STATUS:
+    #     io_states = parsed_result.get("io_states")
+    #     if io_states:
+    #         data_manager.set_io_state(motor_id, "ready", io_states.get("ready", False))
+    #         data_manager.set_io_state(motor_id, "error", io_states.get("error", False))
