@@ -1,0 +1,44 @@
+{
+  "can": {
+    "channel": "can0",
+    "bustype": "socketcan",
+    "bitrate": 500000,
+    "recv_timeout": 0.1,
+    "no_listener_timeout": 2.0
+  },
+"parser": {
+    "parser_sleep": 0.01
+  },
+  "motors": {
+    "1": {
+      "name": "Motor_J1",
+      "limit_positive": 100,
+      "limit_negative": -100
+    },
+    "2": {
+      "name": "Motor_J2",
+      "limit_positive": 120,
+      "limit_negative": -120
+    },
+    "3": {
+      "name": "Motor_J3",
+      "limit_positive": 150,
+      "limit_negative": -150
+    },
+    "4": {
+      "name": "Motor_J4",
+      "limit_positive": 180,
+      "limit_negative": -180
+    },
+    "5": {
+      "name": "Motor_J5",
+      "limit_positive": 90,
+      "limit_negative": -90
+    },
+    "6": {
+      "name": "Motor_J6",
+      "limit_positive": 180,
+      "limit_negative": -180
+    }
+  }
+}
